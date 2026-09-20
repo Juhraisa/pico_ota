@@ -1011,7 +1011,10 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);}
     </div>
   </section>
 </main>
-<footer class="foot">Osoite: <span id="ipAddr">-</span></footer>
+<footer class="foot">
+  <div>Osoite: <span id="ipAddr">-</span></div>
+  <div>MAC: <span id="macAddr">-</span></div>
+</footer>
 <div class="toast" id="toast"></div>
 <script>
 let pinsRendered = false;
@@ -1226,6 +1229,7 @@ async function fetchState(){
 
     document.getElementById("priceNow").textContent = s.price_now != null ? s.price_now.toFixed(2) : "-";
     document.getElementById("ipAddr").textContent = s.ip || "-";
+    document.getElementById("macAddr").textContent = s.mac || "-";
     document.getElementById("appVersion").textContent = s.app_version || "-";
     document.getElementById("otaMsg").textContent = s.ota_message || "";
     updateTemps(s.temps);
@@ -1315,6 +1319,7 @@ def build_state():
         "ble": ble_status.get("active", False),
         "ntp": ntp_synced,
         "ip": wlan.ifconfig()[0] if (wlan and wifi_status.get("connected")) else None,
+        "mac": ":".join("%02X" % b for b in wlan.config("mac")) if wlan else None,
         "pins": pins_out,
         "app_version": APP_VERSION,
         "ota_checking": ota_status["checking"],
