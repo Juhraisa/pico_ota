@@ -131,7 +131,7 @@ SETTINGS_FILE = "/settings.json"
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
 APP_VERSION = "260920"
 OTA_HOST = "raw.githubusercontent.com"
-OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
+OTA_PATH_PREFIX = "/Juhraisa/pico_ota/refs/heads/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
 OTA_BACKUP_PATH = "/main_prev.py"   # edellinen toimiva versio, kasin palautettavissa USB:lla
 OTA_STAGING_PATH = "/main_new.py"   # tahan ladataan uusi versio ennen kayttoonottoa
