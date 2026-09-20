@@ -18,6 +18,10 @@ Mita tama tekee:
     kartassa nimettyjen huoneiden lämpötilat näytetään sivun ylälaidassa.
   - Näyttää sivun ylälaidassa myös reaaliaikaisen kokonaistehon paikalliselta
     Shelly EM3 -mittarilta (SHELLY_HOST, tavallinen HTTP /status-kysely).
+  - OTA-päivitys: "Ohjelmistopäivitys"-napista laite hakee GitHub-repostasi
+    (OTA_HOST+OTA_PATH_PREFIX) uusimman main.py:n, jos version.txt poikkeaa
+    APP_VERSIONista, ja ottaa vanhasta varmuuskopion (main_prev.py) ennen
+    käyttöönottoa ja uudelleenkäynnistystä.
   - Asetukset (ajastukset, hintarajat, lämpötilatavoitteet) tallentuvat
     tiedostoon /settings.json ja palautuvat uudelleenkäynnistyksen jälkeen.
 
@@ -64,6 +68,7 @@ import json
 import gc
 import struct
 import aioble
+import os
 from micropython import const
 
 # =============================================================================
@@ -119,6 +124,17 @@ SPOT_HOST = "api.spot-hinta.fi"
 SPOT_PATH = "/TodayAndDayForward?priceResolution=60"
 
 SETTINGS_FILE = "/settings.json"
+
+# Nosta APP_VERSION jokaisen julkaistavan main.py-muutoksen yhteydessa. Push
+# muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
+# version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
+# lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
+APP_VERSION = "260920"
+OTA_HOST = "raw.githubusercontent.com"
+OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
+OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
+OTA_BACKUP_PATH = "/main_prev.py"   # edellinen toimiva versio, kasin palautettavissa USB:lla
+OTA_STAGING_PATH = "/main_new.py"   # tahan ladataan uusi versio ennen kayttoonottoa
 
 # =============================================================================
 # PINNIT JA HUONEET
@@ -208,6 +224,7 @@ shelly_power = {"value": None, "updated": 0}
 
 wifi_status = {"connected": False}
 ble_status = {"active": False}
+ota_status = {"checking": False, "message": ""}
 wlan = None
 
 prices_today = []       # [(tunti, snt/kWh), ...]
@@ -715,6 +732,137 @@ async def automation_task():
 
 
 # =============================================================================
+# OTA-PAIVITYS (hakee uusimman main.py:n GitHub-repostasi)
+# =============================================================================
+# Periaate: 1) haetaan ensin vain pieni version.txt ja verrataan APP_VERSIONiin,
+# 2) jos eri, ladataan main.py SUORAAN TIEDOSTOON (ei RAM-puskuriin - tiedosto
+# on kymmenia kilotavuja, eika sita haluta kokonaisena muistiin nykyisen
+# muistitilanteen paalle), 3) tarkistetaan etta tiedosto nayttaa jarkevalta
+# (koko + kelpaako se Python-syntaksiltaan), 4) vasta sitten vanha main.py
+# siirretaan talteen nimella main_prev.py ja uusi otetaan kayttoon, minka
+# jalkeen laite kaynnistetaan uudelleen. main_prev.py EI koskaan poisteta
+# automaattisesti onnistumisen jalkeenkaan - jos uusi versio ei toimi, se
+# palautetaan kasin (mpremote cp :main_prev.py :main.py) USB:n kautta.
+
+async def ota_check_version():
+    """Hakee version.txt:n sisallon (muutama tavu, kevyt haku)."""
+    body = await http_get(OTA_HOST, OTA_PATH_PREFIX + "/version.txt", timeout=10)
+    return body.decode().strip()
+
+
+async def ota_download_to_file(path, dest_path):
+    """Striimaa GET-vastauksen suoraan tiedostoon lukien pieni pala kerrallaan,
+    jottei koko tiedostoa (main.py, kymmenia kt) tarvitse pitaa RAM:issa
+    yhtena palana niin kuin http_get() tekisi. Vaatii Content-Length-otsakkeen
+    (raw.githubusercontent.com lahettaa sen aina staattiselle tiedostolle)."""
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(OTA_HOST, 443, ssl=True), 10
+    )
+    try:
+        req = (
+            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: picow-sahko/1.0\r\n"
+            "Connection: close\r\n\r\n"
+        ) % (path, OTA_HOST)
+        writer.write(req.encode())
+        await writer.drain()
+
+        status_line = await asyncio.wait_for(reader.readline(), 10)
+        parts = status_line.split(b" ", 2)
+        code = int(parts[1]) if len(parts) > 1 else 0
+
+        content_length = None
+        while True:
+            line = await asyncio.wait_for(reader.readline(), 10)
+            if line in (b"\r\n", b"\n", b""):
+                break
+            if line.lower().startswith(b"content-length:"):
+                content_length = int(line.split(b":", 1)[1].strip())
+
+        if code != 200:
+            raise OSError("HTTP-virhe %d" % code)
+        if not content_length:
+            raise OSError("palvelin ei ilmoittanut sisallon pituutta")
+
+        written = 0
+        with open(dest_path, "wb") as f:
+            while written < content_length:
+                chunk = await asyncio.wait_for(
+                    reader.read(min(1024, content_length - written)), 10
+                )
+                if not chunk:
+                    raise OSError("yhteys katkesi kesken latauksen")
+                f.write(chunk)
+                written += len(chunk)
+        return written
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def _ota_looks_valid(path, min_bytes=5000):
+    """Kevyt jarkevyystarkistus ennen kayttoonottoa: riittavan iso tiedosto
+    eika ilmiselvaa syntaksivirhetta. Ei voi taata etta koodi on virheeton,
+    mutta nappaa yleisimman tavan miten paivitys menisi pieleen."""
+    try:
+        size = os.stat(path)[6]
+    except Exception as e:
+        return False, "tiedostoa ei loydy: %s" % e
+    if size < min_bytes:
+        return False, "tiedosto on epailyttavan pieni (%d tavua)" % size
+    try:
+        with open(path) as f:
+            compile(f.read(), path, "exec")
+    except SyntaxError as e:
+        return False, "syntaksivirhe ladatussa tiedostossa: %s" % e
+    except Exception:
+        pass  # compile() ei ehka ole tuettu tassa builtissa - ohitetaan tarkistus
+    gc.collect()
+    return True, ""
+
+
+async def ota_check_and_apply(force=False):
+    """Tarkistaa onko GitHub-repossa APP_VERSIONista poikkeava version.txt, ja
+    jos on (tai force=True), lataa main.py:n, tarkistaa sen jarkevyyden, ottaa
+    varmuuskopion nykyisesta main.py:sta ja kaynnistaa laitteen uudelleen."""
+    ota_status["checking"] = True
+    ota_status["message"] = "Tarkistetaan paivitysta..."
+    try:
+        remote_version = await ota_check_version()
+        if remote_version == APP_VERSION and not force:
+            ota_status["message"] = "Jo uusin versio (%s)" % APP_VERSION
+            return
+
+        ota_status["message"] = "Ladataan versiota %s..." % remote_version
+        size = await ota_download_to_file(OTA_PATH_PREFIX + "/main.py", OTA_STAGING_PATH)
+
+        ok, err = _ota_looks_valid(OTA_STAGING_PATH)
+        if not ok:
+            os.remove(OTA_STAGING_PATH)
+            ota_status["message"] = "Paivitys hylattiin: " + err
+            return
+
+        try:
+            os.remove(OTA_BACKUP_PATH)
+        except Exception:
+            pass
+        os.rename(OTA_MAIN_PATH, OTA_BACKUP_PATH)
+        os.rename(OTA_STAGING_PATH, OTA_MAIN_PATH)
+
+        ota_status["message"] = "Paivitetty (%d tavua, versio %s) - kaynnistetaan uudelleen" % (size, remote_version)
+        print(ota_status["message"])
+        await asyncio.sleep(1)  # antaa HTTP-vastauksen ehtia lahtea selaimelle
+        machine.reset()
+    except Exception as e:
+        ota_status["message"] = "Paivitys epaonnistui: %s" % e
+        print(ota_status["message"])
+    finally:
+        ota_status["checking"] = False
+
+
+# =============================================================================
 # WEB-KAYTTOLIITTYMA (staattinen HTML+CSS+JS, data haetaan /api/state:sta)
 # =============================================================================
 
@@ -853,6 +1001,14 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);}
   <section class="card">
     <h2>Ohjaukset</h2>
     <div id="pins"></div>
+  </section>
+  <section class="card">
+    <h2>Ohjelmistopaivitys</h2>
+    <div class="setting-block">
+      <div>Kaynnissa oleva versio: <span id="appVersion">-</span></div>
+      <button onclick="checkOta()">Tarkista paivitys</button>
+      <div class="muted" id="otaMsg" style="margin-top:.5em;"></div>
+    </div>
   </section>
 </main>
 <footer class="foot">Osoite: <span id="ipAddr">-</span></footer>
@@ -1014,6 +1170,13 @@ function saveTemp(pin){
   });
 }
 
+function checkOta(){
+  document.getElementById("otaMsg").textContent = "Kaynnistetaan tarkistusta...";
+  fetch("/api/ota", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({force:false})})
+    .catch(function(){})
+    .then(function(){ fetchState(); });
+}
+
 let toastTimer = null;
 function showToast(msg){
   const t = document.getElementById("toast");
@@ -1063,6 +1226,8 @@ async function fetchState(){
 
     document.getElementById("priceNow").textContent = s.price_now != null ? s.price_now.toFixed(2) : "-";
     document.getElementById("ipAddr").textContent = s.ip || "-";
+    document.getElementById("appVersion").textContent = s.app_version || "-";
+    document.getElementById("otaMsg").textContent = s.ota_message || "";
     updateTemps(s.temps);
     updateTempItem("shelly-power", s.shelly_power, " kW");
 
@@ -1151,6 +1316,9 @@ def build_state():
         "ntp": ntp_synced,
         "ip": wlan.ifconfig()[0] if (wlan and wifi_status.get("connected")) else None,
         "pins": pins_out,
+        "app_version": APP_VERSION,
+        "ota_checking": ota_status["checking"],
+        "ota_message": ota_status["message"],
     }
 
 
@@ -1209,6 +1377,21 @@ async def handle_api_temp(writer, body):
         await send_response(writer, 400, "application/json", b'{"ok":false}')
 
 
+async def handle_api_ota(writer, body):
+    if ota_status["checking"]:
+        await send_response(writer, 409, "application/json", b'{"ok":false,"error":"jo kaynnissa"}')
+        return
+    try:
+        d = json.loads(body) if body else {}
+        force = bool(d.get("force", False))
+    except Exception:
+        force = False
+    # Kaynnistetaan taustatehtavana, jotta HTTP-vastaus ehtii lahtea
+    # selaimelle ennen kuin lataus/uudelleenkaynnistys mahdollisesti alkaa.
+    asyncio.create_task(ota_check_and_apply(force=force))
+    await send_response(writer, 200, "application/json", b'{"ok":true}')
+
+
 async def handle_client(reader, writer):
     try:
         request_line = await asyncio.wait_for(reader.readline(), 5)
@@ -1251,6 +1434,8 @@ async def handle_client(reader, writer):
             await handle_api_price(writer, body)
         elif method == "POST" and path_only == "/api/temp":
             await handle_api_temp(writer, body)
+        elif method == "POST" and path_only == "/api/ota":
+            await handle_api_ota(writer, body)
         else:
             await send_response(writer, 404, "text/plain", b"Ei loydy")
     except Exception as e:
