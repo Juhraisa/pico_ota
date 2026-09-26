@@ -11,8 +11,9 @@ Mita tama tekee:
   - Näyttää nykyisen hinnan (snt/kWh) seka tämän ja seuraavan vuorokauden
     tuntihinnat pylväsdiagrammeina, joissa jokaisessa pylväässä lukee arvo.
   - GPIO-pinnit 14-21 releohjauksiin, kullekin oma nimi, manuaalinen
-    päälle/pois-kytkin, ajastus, hintakattoautomatiikka ja (makuuhuone +
-    olohuone) lämpötila-automatiikka.
+    päälle/pois-kytkin, ajastus (kellonaika TAI auringonlasku/-nousu,
+    lasketaan matemaattisesti HOME_LAT/HOME_LON:lle - ei tarvitse verkkoa),
+    hintakattoautomatiikka ja (makuuhuone + olohuone) lämpötila-automatiikka.
   - Lukee huoneiden lämpötilat suoraan RuuviTag-antureiden BLE-mainos-
     paketeista (aioble) - ei enää MQTT-välittäjää. Kaikkien BLE_TAG_ROOMS-
     kartassa nimettyjen huoneiden lämpötilat näytetään sivun ylälaidassa.
@@ -67,6 +68,7 @@ import time
 import json
 import gc
 import struct
+import math
 import aioble
 import os
 from micropython import const
@@ -74,11 +76,18 @@ from micropython import const
 # =============================================================================
 # ASETUKSET - MUOKKAA NAMA OMAAN YMPARISTOOSI SOPIVIKSI
 # =============================================================================
+APP_VERSION = "260926"
 
 WIFI_SSID = "x"
 WIFI_PASSWORD = "h1rvensalo!"
 
 NTP_HOST = "fi.pool.ntp.org"
+
+# Koti-/laitesijainti auringonnousu-/laskulaskentaa varten ("Ajastus"-
+# automatiikassa voi kayttaa "Auringonlasku"/"Auringonnousu" -vaihtoehtoa
+# kiintean kellonajan sijaan). Oletus on Turku - vaihda omaan sijaintiisi.
+HOME_LAT = 60.45
+HOME_LON = 22.27
 
 # Huoneiden lampotilat luetaan RuuviTagien BLE-mainospaketeista (katso
 # BLE_TAG_ROOMS alempana "PINNIT JA HUONEET" -osiossa, jossa jokaiselle
@@ -129,9 +138,9 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-APP_VERSION = "260920"
+
 OTA_HOST = "raw.githubusercontent.com"
-OTA_PATH_PREFIX = "/Juhraisa/pico_ota/refs/heads/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
+OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
 OTA_BACKUP_PATH = "/main_prev.py"   # edellinen toimiva versio, kasin palautettavissa USB:lla
 OTA_STAGING_PATH = "/main_new.py"   # tahan ladataan uusi versio ennen kayttoonottoa
@@ -352,6 +361,47 @@ def local_date_str(offset_days=0):
     epoch = time.time() + dst_offset(time.time()) * 3600 + offset_days * 86400
     t = time.localtime(epoch)
     return "%04d-%02d-%02d" % (t[0], t[1], t[2])
+
+
+def sun_times(lat_deg, lon_deg, day_of_year_n, utc_offset_hours):
+    """Palauttaa (nousu_h, nousu_min, lasku_h, lasku_min) paikallista kellon-
+    aikaa NOAA:n pienen tarkkuuden aurinkokaavalla (Meeus). Ei tarvitse
+    verkkoa - pelkka matematiikka. Tarkkuus n. 1 min naiden leveysasteiden
+    alueella. day_of_year_n on 1=tammikuun 1. paiva."""
+    lat = math.radians(lat_deg)
+    gamma = (2 * math.pi / 365) * (day_of_year_n - 1)
+
+    eqtime = 229.18 * (0.000075 + 0.001868*math.cos(gamma) - 0.032077*math.sin(gamma)
+                        - 0.014615*math.cos(2*gamma) - 0.040849*math.sin(2*gamma))
+    decl = (0.006918 - 0.399912*math.cos(gamma) + 0.070257*math.sin(gamma)
+            - 0.006758*math.cos(2*gamma) + 0.000907*math.sin(2*gamma)
+            - 0.002697*math.cos(3*gamma) + 0.00148*math.sin(3*gamma))
+
+    zenith = math.radians(90.833)  # ilmakehan taittuminen + auringon sade
+    cos_ha = (math.cos(zenith) / (math.cos(lat) * math.cos(decl))) - math.tan(lat) * math.tan(decl)
+    cos_ha = max(-1.0, min(1.0, cos_ha))  # suoja napa-alueille (ei osu Suomen etelaosiin)
+    ha = math.degrees(math.acos(cos_ha))
+
+    sunrise_min = 720 - 4*(lon_deg + ha) - eqtime + utc_offset_hours*60
+    sunset_min = 720 - 4*(lon_deg - ha) - eqtime + utc_offset_hours*60
+
+    def to_hm(m):
+        m = m % (24*60)
+        return int(m // 60), int(round(m % 60))
+
+    return to_hm(sunrise_min) + to_hm(sunset_min)
+
+
+def resolve_sched_time(value, lt):
+    """Palauttaa 'HH:MM'-merkkijonon. Jos value on 'sunset' tai 'sunrise',
+    lasketaan tamanpaivainen auringonlasku/-nousu HOME_LAT/HOME_LON:lle -
+    muuten value palautetaan sellaisenaan (jo valmis HH:MM)."""
+    if value not in ("sunset", "sunrise"):
+        return value
+    day_n = _days_from_civil(lt[0], lt[1], lt[2]) - _days_from_civil(lt[0], 1, 1) + 1
+    utc_off = dst_offset(time.time())
+    rh, rmin, sh, smin = sun_times(HOME_LAT, HOME_LON, day_n, utc_off)
+    return "%02d:%02d" % (sh, smin) if value == "sunset" else "%02d:%02d" % (rh, rmin)
 
 
 def _seconds_until(hour, minute):
@@ -714,7 +764,9 @@ def evaluate_all_pins():
                 desired = price_now <= cfg["price_limit"]
         elif cfg["sched_enabled"]:
             mode = "sched"
-            desired = in_schedule_window(now_minu, cfg["sched_on"], cfg["sched_off"])
+            on_str = resolve_sched_time(cfg["sched_on"], lt)
+            off_str = resolve_sched_time(cfg["sched_off"], lt)
+            desired = in_schedule_window(now_minu, on_str, off_str)
 
         cfg["auto_mode"] = mode
         if mode is not None and desired != cfg["state"]:
@@ -840,16 +892,55 @@ async def ota_check_and_apply(force=False):
 
         ok, err = _ota_looks_valid(OTA_STAGING_PATH)
         if not ok:
-            os.remove(OTA_STAGING_PATH)
+            try:
+                os.remove(OTA_STAGING_PATH)
+            except Exception:
+                pass
             ota_status["message"] = "Paivitys hylattiin: " + err
             return
 
         try:
             os.remove(OTA_BACKUP_PATH)
         except Exception:
-            pass
-        os.rename(OTA_MAIN_PATH, OTA_BACKUP_PATH)
-        os.rename(OTA_STAGING_PATH, OTA_MAIN_PATH)
+            pass  # ei ollut aiempaa varmuuskopiota - ok
+
+        try:
+            os.stat(OTA_MAIN_PATH)
+        except OSError:
+            try:
+                os.remove(OTA_STAGING_PATH)
+            except Exception:
+                pass
+            ota_status["message"] = (
+                "Paivitys epaonnistui: %s -tiedostoa ei loytynyt laitteen levylta. "
+                "Onko ohjelma varmasti tallennettu levylle taman nimisena (esim. "
+                "Thonnyssa 'Tallenna nimella' -> laite), eika vain ajettu editorista "
+                "kayttamatta levylle tallentamista?" % OTA_MAIN_PATH
+            )
+            print(ota_status["message"])
+            return
+
+        try:
+            os.rename(OTA_MAIN_PATH, OTA_BACKUP_PATH)
+        except Exception as e:
+            ota_status["message"] = "Paivitys epaonnistui varmuuskopiointivaiheessa (%s): %s" % (OTA_MAIN_PATH, e)
+            print(ota_status["message"])
+            return
+
+        try:
+            os.rename(OTA_STAGING_PATH, OTA_MAIN_PATH)
+        except Exception as e:
+            # Vanha main.py ehdittiin jo siirtaa syrjaan, mutta uutta ei saatu
+            # tilalle - palautetaan valittomasti edellinen versio, ettei laite
+            # jaa kokonaan ilman main.py:ta.
+            ota_status["message"] = "Paivitys epaonnistui kayttoonottovaiheessa (%s): %s - palautetaan edellinen versio" % (OTA_STAGING_PATH, e)
+            print(ota_status["message"])
+            try:
+                os.rename(OTA_BACKUP_PATH, OTA_MAIN_PATH)
+            except Exception as e2:
+                ota_status["message"] += " (palautuskin epaonnistui: %s)" % e2
+                print(ota_status["message"])
+            return
 
         ota_status["message"] = "Paivitetty (%d tavua, versio %s) - kaynnistetaan uudelleen" % (size, remote_version)
         print(ota_status["message"])
@@ -1067,6 +1158,20 @@ function autoModeLabel(m){
   return m === "temp" ? "Lampotila" : m === "price" ? "Hinta" : m === "sched" ? "Ajastus" : "";
 }
 
+function schedModeSelectHtml(id, which, currentMode){
+  const opts = [["clock","Kellonaika"], ["sunset","Auringonlasku"], ["sunrise","Auringonnousu"]];
+  return '<select id="sched-'+which+'-mode-'+id+'" onchange="onSchedModeChange('+id+',\''+which+'\')">'
+    + opts.map(function(o){
+        return '<option value="'+o[0]+'"'+(o[0]===currentMode?" selected":"")+'>'+o[1]+'</option>';
+      }).join("")
+    + '</select>';
+}
+
+function onSchedModeChange(id, which){
+  const mode = document.getElementById("sched-"+which+"-mode-"+id).value;
+  document.getElementById("sched-"+which+"-"+id).style.display = (mode === "clock") ? "" : "none";
+}
+
 function renderPinsOnce(s){
   const el = document.getElementById("pins");
   el.innerHTML = Object.keys(s.pins).map(function(id){
@@ -1081,6 +1186,10 @@ function renderPinsOnce(s){
       + '<button onclick="saveTemp('+id+')">Tallenna</button>'
       + '</div>'
     );
+    const onMode = (p.sched_on === "sunset" || p.sched_on === "sunrise") ? p.sched_on : "clock";
+    const offMode = (p.sched_off === "sunset" || p.sched_off === "sunrise") ? p.sched_off : "clock";
+    const onClockVal = onMode === "clock" ? p.sched_on : "20:00";
+    const offClockVal = offMode === "clock" ? p.sched_off : "07:00";
     return (
       '<div class="pin-card">'
       + '<div class="pin-head"><div>'
@@ -1094,10 +1203,13 @@ function renderPinsOnce(s){
       + '<details><summary>Asetukset</summary>'
       + '<div class="setting-block">'
       + '<label><input type="checkbox" id="sched-en-'+id+'" '+(p.sched_enabled?"checked":"")+'> Ajastus</label>'
-      + '<div class="row">'
-      + '<input type="time" id="sched-on-'+id+'" value="'+p.sched_on+'" aria-label="Ajastuksen alkuaika">'
-      + '<span>-</span>'
-      + '<input type="time" id="sched-off-'+id+'" value="'+p.sched_off+'" aria-label="Ajastuksen loppuaika">'
+      + '<div class="row"><span>Paalle</span>'
+      + schedModeSelectHtml(id, "on", onMode)
+      + '<input type="time" id="sched-on-'+id+'" value="'+onClockVal+'" style="'+(onMode==="clock"?"":"display:none")+'" aria-label="Ajastuksen alkuaika">'
+      + '</div>'
+      + '<div class="row"><span>Pois</span>'
+      + schedModeSelectHtml(id, "off", offMode)
+      + '<input type="time" id="sched-off-'+id+'" value="'+offClockVal+'" style="'+(offMode==="clock"?"":"display:none")+'" aria-label="Ajastuksen loppuaika">'
       + '</div>'
       + '<button onclick="saveSchedule('+id+')">Tallenna</button>'
       + '</div>'
@@ -1150,12 +1262,17 @@ async function postJSON(url, obj){
   }catch(e){}
   fetchState();
 }
+function schedValue(pin, which){
+  const mode = document.getElementById("sched-"+which+"-mode-"+pin).value;
+  if(mode === "clock") return document.getElementById("sched-"+which+"-"+pin).value;
+  return mode;
+}
 function saveSchedule(pin){
   postJSON("/api/schedule", {
     pin: +pin,
     enabled: document.getElementById("sched-en-"+pin).checked,
-    on: document.getElementById("sched-on-"+pin).value,
-    off: document.getElementById("sched-off-"+pin).value
+    on: schedValue(pin, "on"),
+    off: schedValue(pin, "off")
   });
 }
 function savePrice(pin){
@@ -1339,6 +1456,22 @@ async def handle_api_pin(writer, body):
         await send_response(writer, 400, "application/json", b'{"ok":false}')
 
 
+def _validate_sched_value(v, current):
+    """Hyvaksyy 'sunset'/'sunrise' sellaisenaan, tai kelvollisen 'HH:MM'-
+    ajan; muuten sailyttaa nykyisen arvon (ei koskaan tallenneta roskaa)."""
+    v = str(v)
+    if v in ("sunset", "sunrise"):
+        return v
+    v = v[:5]
+    try:
+        hh, mm = v.split(":")
+        if 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59:
+            return v
+    except Exception:
+        pass
+    return current
+
+
 async def handle_api_schedule(writer, body):
     try:
         d = json.loads(body)
@@ -1346,8 +1479,8 @@ async def handle_api_schedule(writer, body):
         if p not in PIN_NUMBERS:
             raise ValueError("tuntematon pinni")
         pins[p]["sched_enabled"] = bool(d.get("enabled", False))
-        pins[p]["sched_on"] = str(d.get("on", pins[p]["sched_on"]))[:5]
-        pins[p]["sched_off"] = str(d.get("off", pins[p]["sched_off"]))[:5]
+        pins[p]["sched_on"] = _validate_sched_value(d.get("on", pins[p]["sched_on"]), pins[p]["sched_on"])
+        pins[p]["sched_off"] = _validate_sched_value(d.get("off", pins[p]["sched_off"]), pins[p]["sched_off"])
         save_settings()
         await send_response(writer, 200, "application/json", b'{"ok":true}')
     except Exception:
