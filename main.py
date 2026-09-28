@@ -22,7 +22,10 @@ Mita tama tekee:
   - OTA-päivitys: "Ohjelmistopäivitys"-napista laite hakee GitHub-repostasi
     (OTA_HOST+OTA_PATH_PREFIX) uusimman main.py:n, jos version.txt poikkeaa
     APP_VERSIONista, ja ottaa vanhasta varmuuskopion (main_prev.py) ennen
-    käyttöönottoa ja uudelleenkäynnistystä.
+    käyttöönottoa ja uudelleenkäynnistystä. Uusi versio vaatii vahvistuksen
+    ("Hyväksy tämä versio") OTA_CONFIRM_TIMEOUT sekunnin kuluessa, muuten
+    edellinen versio palautuu automaattisesti - suojaa tilanteelta jossa
+    uusi versio käynnistyy virheittä mutta on silti käytännössä rikki.
   - Asetukset (ajastukset, hintarajat, lämpötilatavoitteet) tallentuvat
     tiedostoon /settings.json ja palautuvat uudelleenkäynnistyksen jälkeen.
 
@@ -76,7 +79,6 @@ from micropython import const
 # =============================================================================
 # ASETUKSET - MUOKKAA NAMA OMAAN YMPARISTOOSI SOPIVIKSI
 # =============================================================================
-APP_VERSION = "260926"
 
 WIFI_SSID = "x"
 WIFI_PASSWORD = "h1rvensalo!"
@@ -138,12 +140,14 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-
+APP_VERSION = "260928"
 OTA_HOST = "raw.githubusercontent.com"
 OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
 OTA_BACKUP_PATH = "/main_prev.py"   # edellinen toimiva versio, kasin palautettavissa USB:lla
 OTA_STAGING_PATH = "/main_new.py"   # tahan ladataan uusi versio ennen kayttoonottoa
+OTA_PENDING_PATH = "/ota_pending.txt"  # olemassaolo = "uusi versio odottaa vahvistusta"
+OTA_CONFIRM_TIMEOUT = 90            # s, jos ei vahvisteta napista tassa ajassa, palautetaan edellinen versio
 
 # =============================================================================
 # PINNIT JA HUONEET
@@ -942,6 +946,9 @@ async def ota_check_and_apply(force=False):
                 print(ota_status["message"])
             return
 
+        with open(OTA_PENDING_PATH, "w") as f:
+            f.write(str(time.time()))
+
         ota_status["message"] = "Paivitetty (%d tavua, versio %s) - kaynnistetaan uudelleen" % (size, remote_version)
         print(ota_status["message"])
         await asyncio.sleep(1)  # antaa HTTP-vastauksen ehtia lahtea selaimelle
@@ -951,6 +958,56 @@ async def ota_check_and_apply(force=False):
         print(ota_status["message"])
     finally:
         ota_status["checking"] = False
+
+
+def get_ota_pending():
+    """Palauttaa (pending, sekunteja_jaljella). pending=False jos markkeria
+    ei ole (normaali kaynti) tai sen sisalto ei ole luettavissa."""
+    try:
+        with open(OTA_PENDING_PATH) as f:
+            started = float(f.read().strip())
+    except Exception:
+        return False, None
+    left = max(0, int(OTA_CONFIRM_TIMEOUT - (time.time() - started)))
+    return True, left
+
+
+async def ota_confirm_watchdog_task():
+    """Kaynnistetaan main():sta VAIN jos OTA_PENDING_PATH on olemassa buutissa
+    (eli edellinen kaynnistys oli juuri asennetun paivityksen aiheuttama).
+    Odottaa jaljella olevan ajan OTA_CONFIRM_TIMEOUTista ja tarkistaa sitten
+    kerran onko markkeri viela olemassa - jos on, kayttaja ei ole vahvistanut
+    /api/ota/confirm -kutsulla, ja edellinen versio palautetaan automaattisesti.
+    Tama suojaa tilanteelta jossa uusi versio kaynnistyy virheittä (Python-
+    puoli toimii) mutta on silti kayttajalle rikki (esim. web-kayttoliittyman
+    JS), koska palautus ei riipu siita etta kayttoliittyma oikeasti toimisi."""
+    pending, remaining = get_ota_pending()
+    if not pending:
+        return  # ei pitaisi tapahtua (main() jo tarkisti), mutta ei kaadeta mitaan
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+    try:
+        os.stat(OTA_PENDING_PATH)
+    except OSError:
+        return  # vahvistettu jo (markkeri poistettu) - ei tehda mitaan
+
+    print("Paivitysta ei vahvistettu %ds kuluessa - palautetaan edellinen versio" % OTA_CONFIRM_TIMEOUT)
+    try:
+        os.remove(OTA_PENDING_PATH)
+    except Exception:
+        pass
+    try:
+        os.remove(OTA_MAIN_PATH)
+    except Exception:
+        pass
+    try:
+        os.rename(OTA_BACKUP_PATH, OTA_MAIN_PATH)
+    except Exception as e:
+        print("Automaattinen palautus epaonnistui:", e)
+        return
+    await asyncio.sleep(1)
+    machine.reset()
 
 
 # =============================================================================
@@ -1016,6 +1073,8 @@ h2{font-weight:600;margin:0 0 .6em;}
 main{max-width:720px;margin:0 auto;padding:1rem;display:flex;flex-direction:column;gap:1rem;}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:1rem 1.1rem;}
 .card h2{font-size:.9rem;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);}
+.ota-pending{border-color:var(--red);border-width:2px;}
+.ota-pending h2{color:var(--red);}
 .muted{color:var(--dim);font-size:.85rem;}
 
 .bars{display:flex;align-items:flex-end;gap:4px;height:150px;overflow-x:auto;padding:0 0 1.6em;margin-top:.5rem;}
@@ -1080,6 +1139,11 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);}
   <div class="temps-row">%%TEMPS_ROW%%<div class="temp-item"><span class="temp-label">Kulutus</span><span class="temp-value" id="shelly-power">-</span></div></div>
 </header>
 <main>
+  <section class="card ota-pending" id="otaPendingCard" style="display:none">
+    <h2>Vahvista paivitys</h2>
+    <p>Uusi versio asennettu. Jos et vahvista, edellinen versio palautuu automaattisesti <span id="otaSecondsLeft">-</span> sekunnin kuluttua.</p>
+    <button onclick="confirmOta()">Hyvaksy tama versio</button>
+  </section>
   <section class="card">
     <h2>Taman vuorokauden hinnat</h2>
     <div class="bars" id="chartToday"></div>
@@ -1160,16 +1224,17 @@ function autoModeLabel(m){
 
 function schedModeSelectHtml(id, which, currentMode){
   const opts = [["clock","Kellonaika"], ["sunset","Auringonlasku"], ["sunrise","Auringonnousu"]];
-  return '<select id="sched-'+which+'-mode-'+id+'" onchange="onSchedModeChange('+id+',\''+which+'\')">'
+  return '<select id="sched-'+which+'-mode-'+id+'" onchange="onSchedModeChange(this)">'
     + opts.map(function(o){
         return '<option value="'+o[0]+'"'+(o[0]===currentMode?" selected":"")+'>'+o[1]+'</option>';
       }).join("")
     + '</select>';
 }
 
-function onSchedModeChange(id, which){
-  const mode = document.getElementById("sched-"+which+"-mode-"+id).value;
-  document.getElementById("sched-"+which+"-"+id).style.display = (mode === "clock") ? "" : "none";
+function onSchedModeChange(selectEl){
+  const parts = selectEl.id.split("-");  // "sched-on-mode-19" -> ["sched","on","mode","19"]
+  const which = parts[1], id = parts[3];
+  document.getElementById("sched-"+which+"-"+id).style.display = (selectEl.value === "clock") ? "" : "none";
 }
 
 function renderPinsOnce(s){
@@ -1297,6 +1362,12 @@ function checkOta(){
     .then(function(){ fetchState(); });
 }
 
+function confirmOta(){
+  fetch("/api/ota/confirm", {method:"POST"})
+    .catch(function(){})
+    .then(function(){ fetchState(); });
+}
+
 let toastTimer = null;
 function showToast(msg){
   const t = document.getElementById("toast");
@@ -1334,6 +1405,15 @@ function updateTemps(temps){
   });
 }
 
+let pollTimer = null;
+let pollIntervalMs = null;
+function schedulePoll(ms){
+  if(pollIntervalMs === ms) return;  // jo oikealla tahdilla - ei tarvitse nollata ajastinta
+  pollIntervalMs = ms;
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(fetchState, ms);
+}
+
 async function fetchState(){
   try{
     const res = await fetch("/api/state");
@@ -1349,6 +1429,16 @@ async function fetchState(){
     document.getElementById("macAddr").textContent = s.mac || "-";
     document.getElementById("appVersion").textContent = s.app_version || "-";
     document.getElementById("otaMsg").textContent = s.ota_message || "";
+
+    const pendingCard = document.getElementById("otaPendingCard");
+    if(s.ota_pending){
+      pendingCard.style.display = "";
+      document.getElementById("otaSecondsLeft").textContent = s.ota_seconds_left != null ? s.ota_seconds_left : "-";
+    } else {
+      pendingCard.style.display = "none";
+    }
+    schedulePoll(s.ota_pending ? 2000 : 15000);
+
     updateTemps(s.temps);
     updateTempItem("shelly-power", s.shelly_power, " kW");
 
@@ -1368,7 +1458,7 @@ async function fetchState(){
 }
 
 fetchState();
-setInterval(fetchState, 15000);
+schedulePoll(15000);
 setInterval(tickClock, 1000);
 </script>
 </body>
@@ -1421,6 +1511,7 @@ def build_state():
         temps_out[room] = {"value": val, "stale": stale}
 
     shelly_val, shelly_stale = get_shelly_power()
+    ota_pending, ota_seconds_left = get_ota_pending()
 
     return {
         "time": "%02d:%02d:%02d" % (lt[3], lt[4], lt[5]),
@@ -1441,6 +1532,8 @@ def build_state():
         "app_version": APP_VERSION,
         "ota_checking": ota_status["checking"],
         "ota_message": ota_status["message"],
+        "ota_pending": ota_pending,
+        "ota_seconds_left": ota_seconds_left,
     }
 
 
@@ -1530,6 +1623,14 @@ async def handle_api_ota(writer, body):
     await send_response(writer, 200, "application/json", b'{"ok":true}')
 
 
+async def handle_api_ota_confirm(writer, body):
+    try:
+        os.remove(OTA_PENDING_PATH)
+    except Exception:
+        pass
+    await send_response(writer, 200, "application/json", b'{"ok":true}')
+
+
 async def handle_client(reader, writer):
     try:
         request_line = await asyncio.wait_for(reader.readline(), 5)
@@ -1574,6 +1675,8 @@ async def handle_client(reader, writer):
             await handle_api_temp(writer, body)
         elif method == "POST" and path_only == "/api/ota":
             await handle_api_ota(writer, body)
+        elif method == "POST" and path_only == "/api/ota/confirm":
+            await handle_api_ota_confirm(writer, body)
         else:
             await send_response(writer, 404, "text/plain", b"Ei loydy")
     except Exception as e:
@@ -1643,6 +1746,13 @@ async def main():
     asyncio.create_task(price_update_task())
     asyncio.create_task(shelly_power_task())
     asyncio.create_task(automation_task())
+
+    try:
+        os.stat(OTA_PENDING_PATH)
+        asyncio.create_task(ota_confirm_watchdog_task())
+        print("Paivitys asennettu edellisella kaynnistyskerralla - odottaa vahvistusta")
+    except OSError:
+        pass  # ei kesken olevaa paivitysta - normaali kaynnistys
 
     await asyncio.start_server(handle_client, "0.0.0.0", HTTP_PORT)
     print("Web-palvelin kaynnissa, portti", HTTP_PORT)
