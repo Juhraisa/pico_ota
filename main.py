@@ -79,7 +79,7 @@ from micropython import const
 # =============================================================================
 # ASETUKSET - MUOKKAA NAMA OMAAN YMPARISTOOSI SOPIVIKSI
 # =============================================================================
-
+APP_VERSION = "260929b"  # nosta jokaisen main.py-muutoksen yhteydessa (OTA-tarkistus)
 WIFI_SSID = "x"
 WIFI_PASSWORD = "h1rvensalo!"
 
@@ -140,7 +140,7 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-APP_VERSION = "260929"
+
 OTA_HOST = "raw.githubusercontent.com"
 OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
@@ -1169,7 +1169,7 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);}
 <footer class="foot">
   <div>Osoite: <span id="ipAddr">-</span></div>
   <div>MAC: <span id="macAddr">-</span></div>
-  <div>Muistia vapaana <span id="memFree">-</span></div>
+  <div>Muistia käytetty <span id="memAlloc">-</span>, vapaana <span id="memFree">-</span></div>
 </footer>
 <div class="toast" id="toast"></div>
 <script>
@@ -1429,6 +1429,7 @@ async function fetchState(){
     document.getElementById("ipAddr").textContent = s.ip || "-";
     document.getElementById("macAddr").textContent = s.mac || "-";
     document.getElementById("memFree").textContent = s.mem_free || "-";
+    document.getElementById("memAlloc").textContent = s.mem_alloc || "-";
     document.getElementById("appVersion").textContent = s.app_version || "-";
     document.getElementById("otaMsg").textContent = s.ota_message || "";
 
@@ -1546,6 +1547,7 @@ def build_state():
         "ota_pending": ota_pending,
         "ota_seconds_left": ota_seconds_left,
         "mem_free": format_bytes_kt_mt(gc.mem_free()),
+        "mem_alloc": format_bytes_kt_mt(gc.mem_alloc()),
     }
 
 
