@@ -140,7 +140,7 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-APP_VERSION = "260928"
+APP_VERSION = "260929"
 OTA_HOST = "raw.githubusercontent.com"
 OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
@@ -1169,6 +1169,7 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);}
 <footer class="foot">
   <div>Osoite: <span id="ipAddr">-</span></div>
   <div>MAC: <span id="macAddr">-</span></div>
+  <div>Muistia vapaana <span id="memFree">-</span></div>
 </footer>
 <div class="toast" id="toast"></div>
 <script>
@@ -1427,6 +1428,7 @@ async function fetchState(){
     document.getElementById("priceNow").textContent = s.price_now != null ? s.price_now.toFixed(2) : "-";
     document.getElementById("ipAddr").textContent = s.ip || "-";
     document.getElementById("macAddr").textContent = s.mac || "-";
+    document.getElementById("memFree").textContent = s.mem_free || "-";
     document.getElementById("appVersion").textContent = s.app_version || "-";
     document.getElementById("otaMsg").textContent = s.ota_message || "";
 
@@ -1478,6 +1480,15 @@ async def send_response(writer, code, ctype, body_bytes):
     writer.write(header.encode())
     writer.write(body_bytes)
     await writer.drain()
+
+
+def format_bytes_kt_mt(n):
+    """Muotoilee tavumaaran luettavaksi merkkijonoksi - 'X kt' tai 'X mt'
+    sen mukaan kumpi on jarkevampi, samaan tapaan kuin konsoliin tulostettava
+    gc.mem_free()-lukema."""
+    if n >= 1024 * 1024:
+        return "%.1f mt" % (n / (1024 * 1024))
+    return "%d kt" % round(n / 1024)
 
 
 def build_state():
@@ -1534,6 +1545,7 @@ def build_state():
         "ota_message": ota_status["message"],
         "ota_pending": ota_pending,
         "ota_seconds_left": ota_seconds_left,
+        "mem_free": format_bytes_kt_mt(gc.mem_free()),
     }
 
 
