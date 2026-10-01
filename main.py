@@ -79,7 +79,7 @@ from micropython import const
 # =============================================================================
 # ASETUKSET - MUOKKAA NAMA OMAAN YMPARISTOOSI SOPIVIKSI
 # =============================================================================
-APP_VERSION = "260929b"  # nosta jokaisen main.py-muutoksen yhteydessa (OTA-tarkistus)
+APP_VERSION = "261001"  # nosta jokaisen main.py-muutoksen yhteydessa (OTA-tarkistus)
 WIFI_SSID = "x"
 WIFI_PASSWORD = "h1rvensalo!"
 
