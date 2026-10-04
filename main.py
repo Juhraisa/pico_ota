@@ -26,6 +26,9 @@ Mita tama tekee:
     ("Hyväksy tämä versio") OTA_CONFIRM_TIMEOUT sekunnin kuluessa, muuten
     edellinen versio palautuu automaattisesti - suojaa tilanteelta jossa
     uusi versio käynnistyy virheittä mutta on silti käytännössä rikki.
+  - Konsoliviestit (samat jotka näkyisivät USB-sarjaportista) talletetaan
+    LOG_MAX_LINES viimeisintä riviä kiertopuskuriin ja ovat katsottavissa
+    selaimessa "Loki"-kortin alta - ei vaadi USB-yhteyttä diagnosointiin.
   - Asetukset (ajastukset, hintarajat, lämpötilatavoitteet) tallentuvat
     tiedostoon /settings.json ja palautuvat uudelleenkäynnistyksen jälkeen.
 
@@ -79,7 +82,7 @@ from micropython import const
 # =============================================================================
 # ASETUKSET - MUOKKAA NAMA OMAAN YMPARISTOOSI SOPIVIKSI
 # =============================================================================
-APP_VERSION = "261001"  # nosta jokaisen main.py-muutoksen yhteydessa (OTA-tarkistus)
+
 WIFI_SSID = "x"
 WIFI_PASSWORD = "h1rvensalo!"
 
@@ -140,7 +143,7 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-
+APP_VERSION = "261004"
 OTA_HOST = "raw.githubusercontent.com"
 OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
@@ -287,7 +290,7 @@ def save_settings():
         with open(SETTINGS_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
-        print("Asetusten tallennus epaonnistui:", e)
+        log("Asetusten tallennus epaonnistui:", e)
 
 
 def load_settings():
@@ -300,9 +303,9 @@ def load_settings():
                 for k in SETTINGS_KEYS:
                     if k in saved:
                         pins[p][k] = saved[k]
-        print("Asetukset ladattu tiedostosta", SETTINGS_FILE)
+        log("Asetukset ladattu tiedostosta", SETTINGS_FILE)
     except Exception as e:
-        print("Ei aiempia tallennettuja asetuksia (tai virhe):", e)
+        log("Ei aiempia tallennettuja asetuksia (tai virhe):", e)
 
 
 # =============================================================================
@@ -359,6 +362,27 @@ def local_now():
     epoch = time.time()
     off = dst_offset(epoch)
     return time.localtime(epoch + off * 3600)
+
+
+# Konsoliviestien rengaspuskuri selainta varten. Harkittiin os.dupterm():ia
+# (MicroPythonin oma "kahdenna terminaali" -mekanismi), mutta sen tuesta
+# print()-kutsuille tavallisesta skriptista (ei interaktiivisesta REPL:ista)
+# loytyi ristiriitaisia kayttajaraportteja eri porteilla - talla tavalla
+# toimivuus ei riipu alustakohtaisista yllatyksista: log() tulostaa
+# tasmalleen kuten print() ennenkin (USB/Thonny-konsoli pysyy ennallaan)
+# ja tallentaa saman rivin myos puskuriin, josta /api/log tarjoilee sen.
+LOG_MAX_LINES = 60
+log_buffer = []
+
+
+def log(*args):
+    msg = " ".join(str(a) for a in args)
+    lt = local_now()
+    line = "%02d:%02d:%02d %s" % (lt[3], lt[4], lt[5], msg)
+    print(line)
+    log_buffer.append(line)
+    if len(log_buffer) > LOG_MAX_LINES:
+        del log_buffer[0]
 
 
 def local_date_str(offset_days=0):
@@ -537,12 +561,12 @@ def _roll_over_day_if_needed():
         prices_today_date = prices_tomorrow_date
         prices_tomorrow = []
         prices_tomorrow_date = None
-        print("Vuorokausi vaihtui - kaytetaan valmiiksi haettua dataa tanaan-datana")
+        log("Vuorokausi vaihtui - kaytetaan valmiiksi haettua dataa tanaan-datana")
     else:
         prices_today = []
         prices_today_date = None
         prices_valid = False
-        print("Vuorokausi vaihtui, mutta uutta dataa ei ole viela saatavilla")
+        log("Vuorokausi vaihtui, mutta uutta dataa ei ole viela saatavilla")
 
 
 def update_price_now():
@@ -601,10 +625,10 @@ async def update_prices():
 
         update_price_now()
 
-        print("Hintatiedot paivitetty:", today_str, "-", len(today_entries),
+        log("Hintatiedot paivitetty:", today_str, "-", len(today_entries),
               "tanaan,", len(tomorrow_entries), "huomenna")
     except Exception as e:
-        print("Hintojen haku epaonnistui:", e)
+        log("Hintojen haku epaonnistui:", e)
     gc.collect()
 
 
@@ -612,7 +636,7 @@ async def price_update_task():
     await update_prices()
     while True:
         wait_s = _seconds_until(PRICE_FETCH_HOUR, PRICE_FETCH_MINUTE)
-        print("Seuraava hintahaku %d s kuluttua (klo %02d:%02d)" %
+        log("Seuraava hintahaku %d s kuluttua (klo %02d:%02d)" %
               (wait_s, PRICE_FETCH_HOUR, PRICE_FETCH_MINUTE))
         await asyncio.sleep(wait_s)
         await update_prices()
@@ -634,7 +658,7 @@ async def shelly_power_task():
             shelly_power["value"] = round(float(data["total_power"]) / 1000, 2)
             shelly_power["updated"] = time.time()
         except Exception as e:
-            print("Shellyn tehonlukeman haku epaonnistui:", e)
+            log("Shellyn tehonlukeman haku epaonnistui:", e)
         await asyncio.sleep(SHELLY_POLL_INTERVAL)
 
 
@@ -652,16 +676,16 @@ except ImportError:
 async def ntp_sync_task():
     global ntp_synced, ntp_last_sync
     if ntptime is None:
-        print("ntptime-moduulia ei loydy - kello ei synkronoidu automaattisesti")
+        log("ntptime-moduulia ei loydy - kello ei synkronoidu automaattisesti")
         return
     while True:
         try:
             ntptime.settime()
             ntp_synced = True
             ntp_last_sync = time.time()
-            print("NTP-aika synkronoitu")
+            log("NTP-aika synkronoitu")
         except Exception as e:
-            print("NTP-synkronointi epaonnistui:", e)
+            log("NTP-synkronointi epaonnistui:", e)
         await asyncio.sleep(NTP_RESYNC_INTERVAL)
 
 
@@ -709,7 +733,7 @@ async def ble_scan_task():
                                 temps[room]["value"] = reading["temp_c"]
                                 temps[room]["updated"] = time.time()
                     except Exception as e:
-                        print("Yksittaisen BLE-mainoksen kasittely epaonnistui:", e)
+                        log("Yksittaisen BLE-mainoksen kasittely epaonnistui:", e)
 
                     seen_count += 1
                     if seen_count >= 40:
@@ -717,7 +741,7 @@ async def ble_scan_task():
                         gc.collect()
         except Exception as e:
             ble_status["active"] = False
-            print("BLE-skannaus keskeytyi, yritetaan uudelleen 5s kuluttua:", e)
+            log("BLE-skannaus keskeytyi, yritetaan uudelleen 5s kuluttua:", e)
             await asyncio.sleep(5)
 
 
@@ -783,7 +807,7 @@ async def automation_task():
             update_price_now()
             evaluate_all_pins()
         except Exception as e:
-            print("Automatiikan paivitys epaonnistui:", e)
+            log("Automatiikan paivitys epaonnistui:", e)
         await asyncio.sleep(AUTOMATION_INTERVAL)
 
 
@@ -921,14 +945,14 @@ async def ota_check_and_apply(force=False):
                 "Thonnyssa 'Tallenna nimella' -> laite), eika vain ajettu editorista "
                 "kayttamatta levylle tallentamista?" % OTA_MAIN_PATH
             )
-            print(ota_status["message"])
+            log(ota_status["message"])
             return
 
         try:
             os.rename(OTA_MAIN_PATH, OTA_BACKUP_PATH)
         except Exception as e:
             ota_status["message"] = "Paivitys epaonnistui varmuuskopiointivaiheessa (%s): %s" % (OTA_MAIN_PATH, e)
-            print(ota_status["message"])
+            log(ota_status["message"])
             return
 
         try:
@@ -938,24 +962,24 @@ async def ota_check_and_apply(force=False):
             # tilalle - palautetaan valittomasti edellinen versio, ettei laite
             # jaa kokonaan ilman main.py:ta.
             ota_status["message"] = "Paivitys epaonnistui kayttoonottovaiheessa (%s): %s - palautetaan edellinen versio" % (OTA_STAGING_PATH, e)
-            print(ota_status["message"])
+            log(ota_status["message"])
             try:
                 os.rename(OTA_BACKUP_PATH, OTA_MAIN_PATH)
             except Exception as e2:
                 ota_status["message"] += " (palautuskin epaonnistui: %s)" % e2
-                print(ota_status["message"])
+                log(ota_status["message"])
             return
 
         with open(OTA_PENDING_PATH, "w") as f:
             f.write(str(time.time()))
 
         ota_status["message"] = "Paivitetty (%d tavua, versio %s) - kaynnistetaan uudelleen" % (size, remote_version)
-        print(ota_status["message"])
+        log(ota_status["message"])
         await asyncio.sleep(1)  # antaa HTTP-vastauksen ehtia lahtea selaimelle
         machine.reset()
     except Exception as e:
         ota_status["message"] = "Paivitys epaonnistui: %s" % e
-        print(ota_status["message"])
+        log(ota_status["message"])
     finally:
         ota_status["checking"] = False
 
@@ -992,7 +1016,7 @@ async def ota_confirm_watchdog_task():
     except OSError:
         return  # vahvistettu jo (markkeri poistettu) - ei tehda mitaan
 
-    print("Paivitysta ei vahvistettu %ds kuluessa - palautetaan edellinen versio" % OTA_CONFIRM_TIMEOUT)
+    log("Paivitysta ei vahvistettu %ds kuluessa - palautetaan edellinen versio" % OTA_CONFIRM_TIMEOUT)
     try:
         os.remove(OTA_PENDING_PATH)
     except Exception:
@@ -1004,7 +1028,7 @@ async def ota_confirm_watchdog_task():
     try:
         os.rename(OTA_BACKUP_PATH, OTA_MAIN_PATH)
     except Exception as e:
-        print("Automaattinen palautus epaonnistui:", e)
+        log("Automaattinen palautus epaonnistui:", e)
         return
     await asyncio.sleep(1)
     machine.reset()
@@ -1027,7 +1051,7 @@ def _temps_row_html():
     return "".join(parts)
 
 
-_INDEX_HTML_TEMPLATE = '''<!doctype html>
+_INDEX_HTML_TEMPLATE = r'''<!doctype html>
 <html lang="fi">
 <head>
 <meta charset="utf-8">
@@ -1102,6 +1126,9 @@ main{max-width:720px;margin:0 auto;padding:1rem;display:flex;flex-direction:colu
 
 details{margin-top:.6rem;}
 summary{cursor:pointer;color:var(--dim);font-size:.85rem;user-select:none;}
+.log-box{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:.6em .8em;
+  font-family:var(--mono);font-size:.75rem;line-height:1.5;max-height:260px;overflow-y:auto;
+  white-space:pre-wrap;word-break:break-word;margin-top:.5rem;}
 .setting-block{background:var(--card2);border-radius:10px;padding:.7rem .8rem;margin-top:.6rem;}
 .setting-block label{display:flex;align-items:center;gap:.5em;font-size:.9rem;}
 .setting-block .row{display:flex;align-items:center;gap:.5em;margin:.5em 0;flex-wrap:wrap;}
@@ -1164,6 +1191,13 @@ input[type=checkbox]{width:16px;height:16px;accent-color:var(--accent);}
       <button onclick="checkOta()">Tarkista paivitys</button>
       <div class="muted" id="otaMsg" style="margin-top:.5em;"></div>
     </div>
+  </section>
+  <section class="card">
+    <h2>Loki</h2>
+    <details id="logDetails">
+      <summary>Nayta konsoliviestit</summary>
+      <pre class="log-box" id="logBox">-</pre>
+    </details>
   </section>
 </main>
 <footer class="foot">
@@ -1369,6 +1403,26 @@ function confirmOta(){
     .then(function(){ fetchState(); });
 }
 
+let logTimer = null;
+async function fetchLog(){
+  try{
+    const res = await fetch("/api/log");
+    const lines = await res.json();
+    const box = document.getElementById("logBox");
+    box.textContent = lines.length ? lines.join("\n") : "(ei viela viesteja)";
+    box.scrollTop = box.scrollHeight;
+  }catch(e){}
+}
+document.getElementById("logDetails").addEventListener("toggle", function(){
+  if(this.open){
+    fetchLog();
+    logTimer = setInterval(fetchLog, 4000);
+  } else if(logTimer){
+    clearInterval(logTimer);
+    logTimer = null;
+  }
+});
+
 let toastTimer = null;
 function showToast(msg){
   const t = document.getElementById("toast");
@@ -1488,8 +1542,8 @@ def format_bytes_kt_mt(n):
     sen mukaan kumpi on jarkevampi, samaan tapaan kuin konsoliin tulostettava
     gc.mem_free()-lukema."""
     if n >= 1024 * 1024:
-        return "%.1f mt" % (n / (1024 * 1024))
-    return "%d kt" % round(n / 1024)
+        return "%.2f mt" % (n / (1024 * 1024))
+    return "%.2f kt" % round(n / 1024, 2)
 
 
 def build_state():
@@ -1547,7 +1601,7 @@ def build_state():
         "ota_pending": ota_pending,
         "ota_seconds_left": ota_seconds_left,
         "mem_free": format_bytes_kt_mt(gc.mem_free()),
-        "mem_alloc": format_bytes_kt_mt(gc.mem_alloc()),
+        "mem_alloc": format_bytes_kt_mt(gc.mem_alloc())
     }
 
 
@@ -1645,6 +1699,10 @@ async def handle_api_ota_confirm(writer, body):
     await send_response(writer, 200, "application/json", b'{"ok":true}')
 
 
+async def handle_api_log(writer, body):
+    await send_response(writer, 200, "application/json", json.dumps(log_buffer).encode())
+
+
 async def handle_client(reader, writer):
     try:
         request_line = await asyncio.wait_for(reader.readline(), 5)
@@ -1691,10 +1749,12 @@ async def handle_client(reader, writer):
             await handle_api_ota(writer, body)
         elif method == "POST" and path_only == "/api/ota/confirm":
             await handle_api_ota_confirm(writer, body)
+        elif method == "GET" and path_only == "/api/log":
+            await handle_api_log(writer, body)
         else:
             await send_response(writer, 404, "text/plain", b"Ei loydy")
     except Exception as e:
-        print("Web-pyynnon kasittely epaonnistui:", e)
+        log("Web-pyynnon kasittely epaonnistui:", e)
     finally:
         try:
             writer.close()
@@ -1715,19 +1775,19 @@ async def wifi_connect():
     attempt = 0
     while not wlan.isconnected():
         attempt += 1
-        print("WiFi-yhteysyritys", attempt, "-", WIFI_SSID)
+        log("WiFi-yhteysyritys", attempt, "-", WIFI_SSID)
         try:
             wlan.connect(WIFI_SSID, WIFI_PASSWORD)
         except Exception as e:
-            print("wlan.connect() epaonnistui:", e)
+            log("wlan.connect() epaonnistui:", e)
         t0 = time.ticks_ms()
         while not wlan.isconnected() and time.ticks_diff(time.ticks_ms(), t0) < 20000:
             await asyncio.sleep_ms(250)
         if not wlan.isconnected():
-            print("Ei viela yhteytta, yritetaan uudelleen...")
+            log("Ei viela yhteytta, yritetaan uudelleen...")
             await asyncio.sleep(5)
     wifi_status["connected"] = True
-    print("WiFi yhdistetty, IP:", wlan.ifconfig()[0])
+    log("WiFi yhdistetty, IP:", wlan.ifconfig()[0])
 
 
 async def wifi_watchdog_task():
@@ -1742,15 +1802,15 @@ async def wifi_watchdog_task():
             wifi_status["connected"] = True
         else:
             wifi_status["connected"] = False
-            print("WiFi-yhteys poikki, yritetaan yhdistaa uudelleen...")
+            log("WiFi-yhteys poikki, yritetaan yhdistaa uudelleen...")
             try:
                 await wifi_connect()
             except Exception as e:
-                print("WiFi-uudelleenyhdistys epaonnistui:", e)
+                log("WiFi-uudelleenyhdistys epaonnistui:", e)
 
 
 async def main():
-    print("=== Kaynnistetaan sahko- ja kodinohjausjarjestelmaa ===")
+    log("=== Kaynnistetaan sahko- ja kodinohjausjarjestelmaa ===")
     load_settings()
     await wifi_connect()
 
@@ -1764,17 +1824,17 @@ async def main():
     try:
         os.stat(OTA_PENDING_PATH)
         asyncio.create_task(ota_confirm_watchdog_task())
-        print("Paivitys asennettu edellisella kaynnistyskerralla - odottaa vahvistusta")
+        log("Paivitys asennettu edellisella kaynnistyskerralla - odottaa vahvistusta")
     except OSError:
         pass  # ei kesken olevaa paivitysta - normaali kaynnistys
 
     await asyncio.start_server(handle_client, "0.0.0.0", HTTP_PORT)
-    print("Web-palvelin kaynnissa, portti", HTTP_PORT)
+    log("Web-palvelin kaynnissa, portti", HTTP_PORT)
 
     while True:
         await asyncio.sleep(60)
         gc.collect()
-        print("Vapaata muistia gc.collect() jalkeen:", gc.mem_free(), "tavua")
+        log("Vapaata muistia gc.collect() jalkeen:", gc.mem_free(), "tavua")
 
 
 try:
