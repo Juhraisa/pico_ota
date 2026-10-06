@@ -100,7 +100,7 @@ HOME_LON = 22.27
 
 RELAY_ACTIVE_HIGH = True           # False jos relekortti on active-low
 
-TEMP_HYSTERESIS = 0.2              # astetta, lampotila-automatiikan kuollut alue
+TEMP_HYSTERESIS = 0.1              # astetta, lampotila-automatiikan kuollut alue
 TEMP_MAX_AGE = 30 * 60             # s, tata vanhempaa mittausta ei kayteta
 
 # RuuviTag mainostaa lampotilan n. sekunnin valein, joten BLE-skannauksen ei
@@ -143,7 +143,7 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-APP_VERSION = "261004"
+APP_VERSION = "261006"
 OTA_HOST = "raw.githubusercontent.com"
 OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
