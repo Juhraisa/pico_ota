@@ -100,7 +100,7 @@ HOME_LON = 22.27
 
 RELAY_ACTIVE_HIGH = True           # False jos relekortti on active-low
 
-TEMP_HYSTERESIS = 0.1              # astetta, lampotila-automatiikan kuollut alue
+TEMP_HYSTERESIS = 0.2              # astetta, lampotila-automatiikan kuollut alue
 TEMP_MAX_AGE = 30 * 60             # s, tata vanhempaa mittausta ei kayteta
 
 # RuuviTag mainostaa lampotilan n. sekunnin valein, joten BLE-skannauksen ei
@@ -121,8 +121,10 @@ BLE_SCAN_DURATION_MS = 5000        # ms, yhden skannausistunnon pituus ennen uud
 
 PRICE_FETCH_HOUR = 14              # klo (paikallista aikaa), jolloin hinnat haetaan paivittain
 PRICE_FETCH_MINUTE = 20            # min
+PRICE_RETRY_INTERVAL = 600         # s, jos tanaan-dataa ei saada, yritetaan taas taman verran kuluttua
 AUTOMATION_INTERVAL = 20           # s, kuinka usein automatiikka tarkistetaan
-NTP_RESYNC_INTERVAL = 6 * 60 * 60  # s
+NTP_RESYNC_INTERVAL = 6 * 60 * 60  # s, kuinka usein kello synkronoidaan onnistuneen haun jalkeen
+NTP_RETRY_INTERVAL = 30            # s, epaonnistuneen NTP-haun jalkeen yritetaan taas taman verran kuluttua
 
 # Shelly EM3:n oma IP paikallisverkossa (nakyy laitteen omasta /status-
 # vastauksesta kohdasta wifi_sta.ip). Kannattaa varata talle reitittimesta
@@ -130,7 +132,7 @@ NTP_RESYNC_INTERVAL = 6 * 60 * 60  # s
 # reititin joskus jakaa laitteelle eri osoitteen.
 SHELLY_HOST = "192.168.88.196"
 SHELLY_POLL_INTERVAL = 15          # s, kuinka usein tehonlukema haetaan (sama tahti kuin sivu paivittyy)
-SHELLY_MAX_AGE = 120                # s, tata vanhempi lukema merkitaan vanhentuneeksi
+SHELLY_MAX_AGE = 120               # s, tata vanhempi lukema merkitaan vanhentuneeksi
 
 HTTP_PORT = 80
 
@@ -143,7 +145,7 @@ SETTINGS_FILE = "/settings.json"
 # muuttunut main.py JA taman lukeman kanssa yhta suureksi paivitetty
 # version.txt samaan repoon - laite vertailee vain version.txt:ta ennen kuin
 # lataa koko main.py:n, jottei jokainen tarkistus lataisi turhaan 50+ kt.
-APP_VERSION = "261006"
+APP_VERSION = "261010"
 OTA_HOST = "raw.githubusercontent.com"
 OTA_PATH_PREFIX = "/Juhraisa/pico_ota/main"   # {OTA_HOST}{OTA_PATH_PREFIX}/version.txt ja /main.py
 OTA_MAIN_PATH = "/main.py"          # kaynnissa oleva ohjelma
@@ -594,6 +596,7 @@ async def update_prices():
     global prices_today, prices_tomorrow, prices_today_date, prices_tomorrow_date
     global prices_valid, prices_updated_at
     try:
+        gc.collect()  # TLS-kattely tarvitsee isoja yhtenaisia muistilohkoja
         raw = await http_get(SPOT_HOST, SPOT_PATH)
         data = json.loads(raw)
         del raw
@@ -616,30 +619,57 @@ async def update_prices():
         today_entries = sorted(by_date.get(today_str, []))
         tomorrow_entries = sorted(by_date.get(tomorrow_str, []))
 
+        if not today_entries:
+            # Haku onnistui mutta talle paivalle ei loytynyt hintoja: joko API:n
+            # data on myohassa/vanhaa tai laitteen paivamaara on vaarin.
+            log("Ei hintoja tanaan (%s). API:n paivamaarat: %s - onko kello oikein?" %
+                (today_str, ", ".join(sorted(by_date)) or "-"))
+
         prices_today = _aggregate_hourly(today_entries)
         prices_tomorrow = _aggregate_hourly(tomorrow_entries)
         prices_today_date = today_str
         prices_tomorrow_date = tomorrow_str if prices_tomorrow else None
-        prices_valid = True
+        prices_valid = bool(prices_today)
         prices_updated_at = time.time()
 
         update_price_now()
 
         log("Hintatiedot paivitetty:", today_str, "-", len(today_entries),
-              "tanaan,", len(tomorrow_entries), "huomenna")
+            "tanaan,", len(tomorrow_entries), "huomenna")
     except Exception as e:
         log("Hintojen haku epaonnistui:", e)
     gc.collect()
 
 
 async def price_update_task():
-    await update_prices()
     while True:
+        if not prices_valid or not prices_today:
+            # Ei kelvollista tanaan-dataa (kaynnistys, edellinen haku epaonnistui,
+            # tai vuorokauden vaihtuessa huomisen dataa ei ollut) - haetaan nyt,
+            # ja jos ei onnistu, uudelleen pian eika vasta huomenna.
+            while ntptime is not None and not ntp_synced:
+                # Kello ensin: update_prices() suodattaa hinnat paikallisen
+                # paivamaaran mukaan, joten vaarilla kellolla (heti buutin jalkeen
+                # ennen NTP:ta) yksikaan hinta ei osuisi tahan paivaan.
+                await asyncio.sleep(5)
+            await update_prices()
+            if not prices_valid or not prices_today:
+                log("Tanaan-dataa ei saatu - yritetaan uudelleen %d s kuluttua" % PRICE_RETRY_INTERVAL)
+                await asyncio.sleep(PRICE_RETRY_INTERVAL)
+                continue
         wait_s = _seconds_until(PRICE_FETCH_HOUR, PRICE_FETCH_MINUTE)
         log("Seuraava hintahaku %d s kuluttua (klo %02d:%02d)" %
-              (wait_s, PRICE_FETCH_HOUR, PRICE_FETCH_MINUTE))
-        await asyncio.sleep(wait_s)
-        await update_prices()
+            (wait_s, PRICE_FETCH_HOUR, PRICE_FETCH_MINUTE))
+        # Nukutaan minuutin patkissa ja katsotaan valissa onko data muuttunut
+        # kelvottomaksi (esim. vuorokauden vaihtuessa ilman huomisen dataa) -
+        # silloin haetaan heti, ei vasta seuraavalla paivittaisella hakuajalla.
+        slept = 0
+        while slept < wait_s and prices_valid and prices_today:
+            step = min(60, wait_s - slept)
+            await asyncio.sleep(step)
+            slept += step
+        if prices_valid and prices_today:
+            await update_prices()
 
 
 # =============================================================================
@@ -684,17 +714,23 @@ async def ntp_sync_task():
             ntp_synced = True
             ntp_last_sync = time.time()
             log("NTP-aika synkronoitu")
+            wait_s = NTP_RESYNC_INTERVAL
         except Exception as e:
+            # Ilman oikeaa kelloa mm. hintahaku suodattaa vaarilla paivamaaralla,
+            # joten epaonnistumisen jalkeen ei kannata odottaa kuutta tuntia.
             log("NTP-synkronointi epaonnistui:", e)
-        await asyncio.sleep(NTP_RESYNC_INTERVAL)
+            wait_s = NTP_RETRY_INTERVAL
+        await asyncio.sleep(wait_s)
 
 
 # =============================================================================
 # BLE (aioble) - RUUVITAGIEN LAMPOTILOJEN LUKEMINEN
 # =============================================================================
 # RuuviTagit lahettavat lampotilan BLE-mainospaketeissa (advertisement), joten
-# yhteytta tageihin ei tarvita - aioble kuuntelee mainoksia taustalla ja
-# skannaus jatkuu jatkuvasti (duration_ms=0). Korvaa aiemman MQTT-tilauksen.
+# yhteytta tageihin ei tarvita - aioble kuuntelee mainoksia taustalla. Korvaa
+# aiemman MQTT-tilauksen. Skannaus tehdaan BLE_SCAN_DURATION_MS:n pituisissa
+# patkissa (ei ikuisena duration_ms=0:lla) - katso perustelu ble_scan_task():n
+# ja BLE_SCAN_DURATION_MS:n omista kommenteista (tunnettu aioble-muistivuoto).
 
 _RUUVI_COMPANY_ID = const(0x0499)
 
@@ -820,9 +856,11 @@ async def automation_task():
 # muistitilanteen paalle), 3) tarkistetaan etta tiedosto nayttaa jarkevalta
 # (koko + kelpaako se Python-syntaksiltaan), 4) vasta sitten vanha main.py
 # siirretaan talteen nimella main_prev.py ja uusi otetaan kayttoon, minka
-# jalkeen laite kaynnistetaan uudelleen. main_prev.py EI koskaan poisteta
-# automaattisesti onnistumisen jalkeenkaan - jos uusi versio ei toimi, se
-# palautetaan kasin (mpremote cp :main_prev.py :main.py) USB:n kautta.
+# jalkeen laite kaynnistetaan uudelleen. main_prev.py sailyy aina edellisena
+# TOIMIVANA versiona (jokainen onnistunut paivitys korvaa sen tuoreella -
+# vain yksi varmuuskopio kerrallaan, ei historiaa pidemmalta ajalta). Jos uusi
+# versio ei toimi, se palautetaan kasin (mpremote cp :main_prev.py :main.py)
+# USB:n kautta.
 
 async def ota_check_version():
     """Hakee version.txt:n sisallon (muutama tavu, kevyt haku)."""
@@ -1526,7 +1564,7 @@ INDEX_HTML = _INDEX_HTML_TEMPLATE.replace("%%TEMPS_ROW%%", _temps_row_html()).en
 
 
 async def send_response(writer, code, ctype, body_bytes):
-    reason = {200: "OK", 400: "Bad Request", 404: "Not Found",
+    reason = {200: "OK", 400: "Bad Request", 404: "Not Found", 409: "Conflict",
               413: "Payload Too Large", 500: "Internal Server Error"}.get(code, "")
     header = (
         "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
@@ -1542,8 +1580,8 @@ def format_bytes_kt_mt(n):
     sen mukaan kumpi on jarkevampi, samaan tapaan kuin konsoliin tulostettava
     gc.mem_free()-lukema."""
     if n >= 1024 * 1024:
-        return "%.2f mt" % (n / (1024 * 1024))
-    return "%.2f kt" % round(n / 1024, 2)
+        return "%.1f mt" % (n / (1024 * 1024))
+    return "%d kt" % round(n / 1024)
 
 
 def build_state():
@@ -1602,6 +1640,7 @@ def build_state():
         "ota_seconds_left": ota_seconds_left,
         "mem_free": format_bytes_kt_mt(gc.mem_free()),
         "mem_alloc": format_bytes_kt_mt(gc.mem_alloc())
+
     }
 
 
